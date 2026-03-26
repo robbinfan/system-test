@@ -1,282 +1,290 @@
-# Vespa System Testing: Harness Engineering Plan
+# Vespa Harness Engineering: 实施路径
 
-## 目标
+## 现状
 
-基于 Vespa 系统测试框架，构建自动化 harness engineering 体系，提升搜索引擎开发的自动化水平。
-
----
-
-## 第一阶段：动态测试筛选 + 本地快速反馈
-
-### 问题
-
-795 个系统测试全跑不现实（每个测试需部署完整 Vespa 集群），需要智能选择相关测试。
-
-### 方案
-
-#### 1.0 动态测试筛选（已实现: `bin/select-tests.rb`）
-
-基于代码变更自动选择相关系统测试，无需手动维护测试列表：
-
-```bash
-# 根据 git diff 自动选择测试
-bin/select-tests.rb --diff HEAD~1..HEAD --top 20
-
-# 指定变更文件
-bin/select-tests.rb --files "tests/search/nearest_neighbor/test.sd" --verbose
-
-# 直接输出为 run-tests-on-swarm.sh 参数
-bin/run-tests-on-swarm.sh $(bin/select-tests.rb --diff main..HEAD --top 10 --format runtest)
-```
-
-**筛选策略（6 层打分）：**
-
-| 规则 | 分值 | 说明 |
-|------|------|------|
-| 直接命中 | +100 | 变更文件就是测试文件本身 |
-| 同目录 | +80 | 变更文件和测试在同一 test 目录 |
-| Schema 名匹配 | +60 | 变更的 .sd 文件名出现在测试的 app 中 |
-| 特性重叠 | +0~40 | tensor/hnsw/ranking 等特性指纹匹配 |
-| 框架烟雾测试 | +30 | lib/ 变更时选 basic/smoke 测试 |
-| 分类匹配 | +10 | schema 变更 → search 类测试 |
-
-**特性指纹库**：tensor, hnsw, nearest_neighbor, embedding, bm25, rank_profile, struct_field, document_reference, streaming, searcher, handler, model_evaluation, onnx 等 30+ 特性。
-
-#### 1.1 测试分层
-
-```
-┌─────────────────────────────────────────┐
-│  Level 1: Schema & Config Validation    │  秒级  ← 每次commit
-│  (vespa-lint, schema编译, services.xml) │
-├─────────────────────────────────────────┤
-│  Level 2: 核心功能 System Test 子集     │  分钟级 ← 每次PR
-│  (feeding, basic search, ranking)       │
-├─────────────────────────────────────────┤
-│  Level 3: 完整 System Test             │  小时级 ← nightly/release
-│  (全部795个测试)                        │
-├─────────────────────────────────────────┤
-│  Level 4: Staging Test                  │  升级验证 ← 版本升级前
-│  (旧版本→新版本的upgrade path)          │
-└─────────────────────────────────────────┘
-```
-
-#### 1.2 精选 Level 2 核心测试子集
-
-从现有 tests/ 中挑选对搜索引擎开发最关键的测试：
-
-```
-# 必选：基础功能
-tests/search/basicsearch/          # 基础搜索
-tests/search/feedandget/           # 灌数据和获取
-tests/search/ranking/              # 排序
-tests/search/queryprofiles/        # 查询配置
-
-# 必选：数据一致性
-tests/vds/visitorsaliency/         # 数据访问
-tests/config/deploy/               # 部署验证
-
-# 按需：你的业务场景
-tests/search/nearest_neighbor/     # 如果用向量搜索
-tests/search/struct_and_map_types/ # 如果用复杂类型
-tests/container/                   # 如果有自定义container组件
-```
-
-#### 1.3 轻量化运行脚本
-
-创建一个精简的测试运行入口，绕过 Docker Swarm 全量编排：
-
-```bash
-# 只跑核心子集，单节点模式
-bin/run-tests-on-swarm.sh \
-  --file tests/search/basicsearch/basicsearch.rb \
-  --consoleoutput \
-  --nodelimit 1
-```
+- CI/CD 集成了 ST，但只跑 2 个（太慢）
+- 有线上 skill 能力：k8s 服务发现、schema 拉取、document visit、metrics、logs、search、feed
+- 目标：从"跑 2 个固定 ST" 演进到 "上下文感知的自动化 harness"
 
 ---
 
-## 第二阶段：多 Agent Harness 架构
-
-基于 Anthropic 博客的 Planner-Generator-Evaluator 模式，适配搜索引擎开发场景。
-
-### 2.1 架构设计
+## 实施路径总览
 
 ```
-┌──────────────┐     spec.md      ┌──────────────┐
-│              │ ───────────────→  │              │
-│   Planner    │                   │  Generator   │
-│   Agent      │  ← feedback ───  │  Agent       │
-│              │                   │              │
-└──────────────┘                   └──────┬───────┘
-                                          │
-                                    code changes
-                                          │
-                                          ▼
-                                   ┌──────────────┐
-                                   │  Evaluator   │
-                                   │  Agent       │
-                                   │              │
-                                   │ - Schema验证  │
-                                   │ - ST子集运行  │
-                                   │ - 性能基准    │
-                                   └──────────────┘
+里程碑 0          里程碑 1              里程碑 2              里程碑 3
+CI 跑 2 个 ST  →  智能选 5-15 个 ST  →  线上数据补测试  →  多 Agent Harness
+(现状)            (1-2 周)              (2-4 周)             (4-8 周)
+                   ↑ 已实现               ↑ 已实现框架
+                   select-tests.rb        generate-tests-from-prod.rb
 ```
 
-### 2.2 三个 Agent 的职责
+每个里程碑独立可用，不依赖后续里程碑。
 
-#### Planner Agent
-- 输入：用户简短需求（如"给商品搜索加同义词扩展"）
-- 输出：详细 spec，包括：
-  - 需要修改的 schema (.sd) 文件
-  - services.xml 变更
-  - 预期的搜索行为变化
-  - 需要验证的测试场景
-- 工具：读 codebase、读 Vespa 文档
+---
 
-#### Generator Agent
-- 输入：Planner 的 spec
-- 输出：代码变更（schema、配置、Java 组件）
-- 工作模式：分 sprint 迭代
-  - Sprint 1: Schema 变更 + 基础验证
-  - Sprint 2: 排序/查询逻辑
-  - Sprint 3: 性能调优
-- 自检：`mvn verify -DskipTests`（编译通过）
+## 里程碑 1：智能测试筛选（已实现工具，需集成 CI）
 
-#### Evaluator Agent（关键创新点）
-- **不能自我评估**，必须独立运行
-- 评估手段：
-  1. Schema 编译检查（秒级）
-  2. 核心 System Test 子集（分钟级）
-  3. 自定义验收查询（灌测试数据 → 执行查询 → 验证结果）
-  4. 性能基准对比（如果涉及排序/索引变更）
-- 输出：通过/失败 + 具体失败原因
-- 关键：用 hard threshold，不给 Agent "说服自己没问题" 的机会
+### 已完成
 
-### 2.3 Sprint Contract（核心机制）
+- `bin/select-tests.rb` — 基于 git diff 的 6 层打分测试筛选器
+- 737 个测试的特性指纹索引（tensor, hnsw, ranking 等 30+ 特性）
 
-每个 sprint 开始前，Generator 和 Evaluator 协商验收标准：
+### 待做：集成到你们的 CI
 
 ```yaml
-sprint: 1
-goal: "添加同义词扩展到商品搜索"
-acceptance_criteria:
-  - schema_compiles: true
-  - system_test_pass:
-      - tests/search/basicsearch/basicsearch.rb
-  - custom_query_test:
-      query: "手机"
-      expected_hits_include: ["mobile phone", "cellphone"]
-      min_recall: 0.8
+# 示例：GitHub Actions / 你们的 CI pipeline
+steps:
+  - name: Select relevant system tests
+    run: |
+      TESTS=$(ruby bin/select-tests.rb --diff origin/main..HEAD --top 15 --format runtest)
+      if [ -z "$TESTS" ]; then
+        echo "No relevant ST found, running baseline 2 tests"
+        TESTS="-f search/basicsearch/basic_search.rb -f config/deploy/deploy_and_activate.rb"
+      fi
+      echo "SELECTED_TESTS=$TESTS" >> $GITHUB_ENV
+
+  - name: Run selected system tests
+    run: bin/run-tests-on-swarm.sh $SELECTED_TESTS --consoleoutput
 ```
+
+### 效果
+
+- 从固定 2 个 → 动态 5-15 个，覆盖率大幅提升
+- 改 nearest_neighbor schema → 自动选出 5 个 ANN 测试
+- 改 container 配置 → 自动选出 search_chains 等测试
+- 不相关的变更 → 仍然只跑 2 个 baseline
+
+### 你需要补充什么
+
+1. **确认你们 CI 跑的那 2 个 ST 的具体文件名** — 我把它们设为 fallback baseline
+2. **你们的 CI 环境**：是 GitHub Actions 还是其他？Docker Swarm 在 CI 里怎么启动的？
+3. **可接受的 CI 时长**：目前 2 个 ST 跑多久？能接受到多长？
 
 ---
 
-## 第三阶段：Cursor Self-Hosted Cloud Agent 作为执行层
+## 里程碑 2：线上感知 + 动态测试生成
 
-### 3.1 为什么适合
-
-| 需求 | Cursor Cloud Agent 能力 |
-|------|------------------------|
-| 代码不能离开内网 | Worker 在你的基础设施内运行 |
-| 需要运行 Vespa 集群 | Worker 可以访问内网 Docker/K8s |
-| 长时间运行（ST 慢） | 每个 session 独占 worker |
-| 多 Agent 并行 | K8s operator 支持 worker 池 |
-| 可扩展性 | Helm chart + WorkerDeployment |
-
-### 3.2 部署架构
+### 核心思路
 
 ```
-┌─ Your Infrastructure ──────────────────────────────┐
-│                                                     │
-│  ┌─────────────┐   ┌─────────────┐                 │
-│  │ Worker Pool  │   │ Vespa Test  │                 │
-│  │ (K8s)       │   │ Cluster     │                 │
-│  │             │   │ (Docker     │                 │
-│  │ - Planner   │──→│  Swarm)     │                 │
-│  │ - Generator │   │             │                 │
-│  │ - Evaluator │   └─────────────┘                 │
-│  └──────┬──────┘                                    │
-│         │ HTTPS (outbound only)                     │
-└─────────┼───────────────────────────────────────────┘
-          │
-          ▼
-   ┌──────────────┐
-   │ Cursor Cloud  │
-   │ (Inference)   │
-   └──────────────┘
+                    ┌─────────────────┐
+ git diff ──────→   │  select-tests   │ ──→ 现有 ST 子集
+                    └────────┬────────┘
+                             │
+                      coverage gaps?
+                             │
+                    ┌────────▼────────┐         ┌──────────────┐
+                    │ generate-tests  │ ◄───────│  线上 Vespa   │
+                    │ from-prod       │         │  k8s cluster  │
+                    └────────┬────────┘         │              │
+                             │                  │ ① schema 拉取 │
+                    ┌────────▼────────┐         │ ② visit 数据  │
+                    │ 生成的回归测试    │         │ ③ 查询基线    │
+                    │ feed.json       │         │ ④ metrics    │
+                    │ expected.json   │         └──────────────┘
+                    │ test.rb         │
+                    └─────────────────┘
 ```
 
-### 3.3 实施步骤
+### 已完成框架
 
+- `bin/generate-tests-from-prod.rb` — 4 阶段编排器：
+  1. **ProdCapture** — 从线上拉 schema、visit 文档、抓查询基线、采集 metrics
+  2. **CoverageAnalyzer** — 对比变更特性 vs 已选测试覆盖，找出 gap
+  3. **TestGenerator** — 用线上数据生成完整的 ST（.rb + feed.json + services.xml + expected_results.json）
+  4. **Orchestrator** — 串联整个流程
+
+### 三类覆盖 Gap → 三种线上数据注入
+
+| Gap 类型 | 触发条件 | 线上数据用法 |
+|----------|----------|-------------|
+| **Schema Gap** | 改了 .sd，但没有对应 ST | visit 该 schema 的线上文档 → 生成 feed.json + 基础查询测试 |
+| **Ranking Gap** | 改了 rank-profile/first-phase | 抓线上 top queries → 记录当前结果作为 baseline → 生成排序回归测试 |
+| **Migration Gap** | 改了 struct-field/map/reference | visit 线上真实文档结构 → 验证新 schema 能正确索引旧数据 |
+
+### 待做：对接你们的线上 skill
+
+当前 `ProdCapture` 类用的是标准 Vespa HTTP API：
+
+```ruby
+# 现在的实现（直接 HTTP 调用）
+capture = ProdCapture.new("http://vespa.prod.svc:8080")
+capture.capture_documents("music", sample_size: 50)
+capture.capture_query_baselines(queries)
 ```
-Step 1: 部署 Cursor Worker
-  - Helm chart 安装到现有 K8s 集群
-  - 配置 WorkerDeployment（建议初始 3-5 个 worker）
-  - 网络策略：worker 可访问 Docker Swarm 网络
 
-Step 2: 配置 MCP Server
-  - Vespa CLI MCP：schema验证、部署、查询
-  - Docker/K8s MCP：管理测试集群生命周期
-  - Git MCP：代码提交、分支管理
+**需要你补充的适配层**：
 
-Step 3: 定义 Agent Skills
-  - /vespa-schema-check：编译验证
-  - /vespa-st-quick：跑核心 ST 子集
-  - /vespa-st-full：跑全量 ST
-  - /vespa-perf-bench：性能基准
+```ruby
+# 方案 A：如果你们的 skill 是 CLI 工具
+# 替换 ProdCapture 里的 HTTP 调用为 skill 调用
+def capture_documents_via_skill(schema_name, sample_size)
+  # 你们的 visit skill 命令是什么？类似：
+  `vespa-skill visit --schema #{schema_name} --limit #{sample_size} --format json`
+end
 
-Step 4: 编排 Harness
-  - Planner → Generator → Evaluator 流水线
-  - Sprint contract YAML 模板
-  - 失败自动回滚机制
+def download_schema_via_skill(schema_name)
+  # 你们的 schema 拉取 skill 命令是什么？类似：
+  `vespa-skill schema get #{schema_name}`
+end
+
+# 方案 B：如果你们的 skill 是 MCP Server
+# 通过 Claude Code / Cursor 的 MCP 协议调用
+# 这种方式更适合 harness agent 直接编排
 ```
 
-### 3.4 与 Claude Code 的对比/互补
+### 你需要补充什么
 
-| 维度 | Claude Code (CLI/Web) | Cursor Cloud Agent |
-|------|----------------------|-------------------|
-| 适合场景 | 交互式开发、PR review | 长时间自动化任务 |
-| 运行时长 | 受 session 限制 | 长时间运行 |
-| 基础设施访问 | 本地终端 | 内网 K8s 集群 |
-| 多 Agent | 通过 Agent SDK | 原生 worker pool |
-| 建议用法 | Planner + 日常开发 | Generator + Evaluator |
-
-**推荐组合**：Claude Code 做 Planner（交互式对齐需求），Cursor Cloud Agent 做 Generator + Evaluator（长时间运行 ST）。
+4. **线上 skill 的调用接口**：是 CLI 命令？MCP Server？HTTP API？具体的命令/endpoint 格式是什么？
+5. **线上环境的访问方式**：
+   - k8s service 地址怎么获取？（kubectl？service discovery？固定地址？）
+   - 需要 TLS 证书吗？
+   - 有多套环境吗？（dev/staging/prod）
+6. **数据安全约束**：线上数据 dump 下来有脱敏需求吗？能直接用于测试吗？
+7. **查询日志来源**：有 access log 吗？格式是什么？还是通过 metrics/monitoring 获取 top queries？
 
 ---
 
-## 快速启动：第一周行动项
+## 里程碑 3：多 Agent Harness
 
-1. **[ ] 识别你的核心 ST 子集**
-   - 列出你们搜索引擎实际用到的 Vespa 功能
-   - 从 tests/ 中映射对应的测试文件
-   - 目标：10-20 个核心测试，跑完 < 30 分钟
+### 架构
 
-2. **[ ] 搭建单节点快速测试环境**
-   - 基于 `docker/Dockerfile.systemtest` 构建镜像
-   - 写一个 `run-core-st.sh` 只跑核心子集
-   - 集成到 CI（GitHub Actions 或你们的 CI）
+```
+┌──────────────────────────────────────────────────────────────┐
+│                     Harness Orchestrator                      │
+│                                                              │
+│  ┌──────────┐    spec    ┌───────────┐   code    ┌────────┐ │
+│  │ Planner  │ ─────────→ │ Generator │ ────────→ │Evaluator│ │
+│  │ Agent    │            │ Agent     │           │ Agent   │ │
+│  │          │ ← reject ─ │           │ ← fail ── │         │ │
+│  └──────────┘            └───────────┘           └────┬────┘ │
+│       │                       │                       │      │
+│   reads:                  writes:                  runs:     │
+│   - codebase              - .sd files              - select  │
+│   - vespa docs            - services.xml             -tests  │
+│   - prod metrics          - java code              - gen     │
+│   - issue/ticket          - pom.xml                  -tests  │
+│                                                    - prod    │
+│                                                      capture │
+└──────────────────────────────────────────────────────────────┘
+                                │
+                    ┌───────────┼───────────┐
+                    ▼           ▼           ▼
+              线上 Vespa    测试 Vespa    Git/CI
+              (只读)        (读写)        (push)
+```
 
-3. **[ ] 原型化 Evaluator Agent**
-   - 用 Claude Code 的 Agent SDK 或 Cursor 的 subagent
-   - 让 Evaluator 执行：schema 编译 → 核心 ST → 报告
-   - 这是 harness engineering 的第一个 "非自我评估" 组件
+### 关键设计决策
 
-4. **[ ] 评估 Cursor Cloud Agent**
-   - 申请 self-hosted cloud agent 权限
-   - 在 staging K8s 部署 1 个 worker
-   - 验证 worker 能否访问 Vespa 测试集群
+**Q: Agent 运行在哪里？**
+
+| 选项 | 优势 | 劣势 | 适合 |
+|------|------|------|------|
+| **Claude Code Web** | 即开即用，已有 | session 时长受限 | Planner, 轻量 Evaluator |
+| **Claude Code CLI + Agent SDK** | 灵活，可编程 | 需要自己编排 | 全部，如果有长运行环境 |
+| **Cursor Cloud Agent** | 长运行，worker 池 | 需要部署 k8s operator | Generator + Evaluator |
+| **混合** | 各取所长 | 复杂度高 | 最终目标 |
+
+**建议路径**：先用 Claude Code Web/CLI 验证 Evaluator Agent（里程碑 2 已有工具），再评估是否需要 Cursor Cloud Agent 的长运行能力。
+
+### Sprint Contract 模板
+
+```yaml
+# .harness/sprint-contract.yaml
+task: "给商品搜索加同义词扩展"
+schema: product
+environment:
+  prod_endpoint: http://vespa.prod.svc:8080
+  test_cluster: docker-swarm
+
+sprints:
+  - id: 1
+    goal: "Schema 变更 + 基础功能验证"
+    acceptance:
+      - type: schema_compile
+        pass: true
+      - type: existing_st
+        tests: auto  # 由 select-tests.rb 自动选择
+        pass: all
+      - type: prod_data_feed
+        sample_size: 100
+        pass: "all documents indexed without error"
+
+  - id: 2
+    goal: "同义词查询验证"
+    acceptance:
+      - type: prod_query_regression
+        queries_from: access_log
+        top_n: 20
+        tolerance: 0.1  # 允许 10% hitcount 波动
+      - type: custom_query
+        query: "手机"
+        expect_hits_contain: ["mobile phone", "cellphone"]
+
+  - id: 3
+    goal: "性能验证"
+    acceptance:
+      - type: latency_baseline
+        p99_max_ms: 50
+        source: prod_metrics
+      - type: throughput_baseline
+        qps_min: 1000
+```
+
+### 你需要补充什么
+
+8. **Agent 运行环境偏好**：
+   - 你们团队现在用 Claude Code 还是 Cursor？还是都用？
+   - 有没有可以长时间运行 agent 的机器/环境？
+   - 对 Cursor Cloud Agent 的 self-hosted 部署有兴趣吗？需要多大规模？
+9. **编排偏好**：
+   - 希望 Agent 全自动（push 触发 → 自动跑完 → 输出 PR review），还是半自动（人在环中确认关键步骤）？
+   - 失败后的行为：自动重试修复？还是通知人？
 
 ---
 
-## 成本估算
+## 里程碑 4（远期）：持续学习 + 自优化
 
-基于 Anthropic 博客的数据点：
-- 单次简单任务（单 Agent）：~$9, 20 分钟
-- 完整 harness（多 Agent 多 sprint）：~$200, 6 小时
-- 你的场景（搜索功能迭代）：预估每个 feature $50-150，取决于 ST 复杂度
+### 思路
 
-关键省钱策略：
-- Level 1/2 用便宜模型（Haiku/Sonnet）
-- 只在 Evaluator 和关键决策用 Opus
-- ST 子集精选，避免全量运行
+- **测试选择优化**：记录每次 "选了哪些测试 → 实际哪些 pass/fail"，用反馈调整权重
+- **线上基线自动更新**：定期从线上抓 query baseline，发现 baseline drift 自动告警
+- **Flaky test 检测**：标记不稳定的 ST，降低其权重
+- **成本优化**：分析 token 使用，在 Haiku/Sonnet/Opus 之间动态选模型
+
+---
+
+## 完整工具清单
+
+| 工具 | 状态 | 用途 |
+|------|------|------|
+| `bin/select-tests.rb` | ✅ 已实现 | 基于 git diff 动态选择 ST |
+| `bin/generate-tests-from-prod.rb` | ✅ 框架已实现 | 从线上数据生成回归测试 |
+| `bin/run-tests-on-swarm.sh` | ✅ 已有 | Vespa ST 执行器 |
+| CI 集成 YAML | ⬜ 待做 | 把 select-tests 接入 CI pipeline |
+| 线上 skill 适配层 | ⬜ 待做 | 对接你们的 vespa skill 到 ProdCapture |
+| Sprint Contract 解析器 | ⬜ 待做 | 解析 YAML contract，驱动 Agent 流程 |
+| Evaluator Agent prompt | ⬜ 待做 | Agent 的 system prompt + tool 定义 |
+| Harness Orchestrator | ⬜ 待做 | Planner → Generator → Evaluator 编排 |
+
+---
+
+## 你需要回答的问题（按优先级排序）
+
+### 立即需要（里程碑 1 上线）
+
+1. CI 现在跑的 2 个 ST 的具体文件名是什么？
+2. CI 环境是什么？ST 在 CI 里怎么跑起来的？
+3. 可接受的 CI 时长上限？
+
+### 短期需要（里程碑 2 落地）
+
+4. 线上 skill 的调用方式和接口格式？
+5. k8s 上 Vespa 的服务发现/地址获取方式？
+6. 数据脱敏需求？
+7. 查询日志获取方式？
+
+### 中期需要（里程碑 3 设计）
+
+8. Agent 运行环境偏好和工具选型？
+9. 自动化程度偏好（全自动 vs 人在环中）？
