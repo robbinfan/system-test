@@ -29,23 +29,81 @@ CI 跑 2 个 ST  →  智能选 5-15 个 ST  →  线上数据补测试  →  �
 - `bin/select-tests.rb` — 基于 git diff 的 6 层打分测试筛选器
 - 737 个测试的特性指纹索引（tensor, hnsw, ranking 等 30+ 特性）
 
-### 待做：集成到你们的 CI
+### 待做：集成到 GitLab CI
+
+**现状**：GitLab CI 触发 → build docker → 跑 2 个硬编码 ST
+
+**目标**：利用 GitLab 的 [Dynamic Child Pipeline](https://docs.gitlab.com/ee/ci/pipelines/downstream_pipelines.html#dynamic-child-pipelines)，在 build 之后动态生成测试矩阵。
 
 ```yaml
-# 示例：GitHub Actions / 你们的 CI pipeline
-steps:
-  - name: Select relevant system tests
-    run: |
-      TESTS=$(ruby bin/select-tests.rb --diff origin/main..HEAD --top 15 --format runtest)
-      if [ -z "$TESTS" ]; then
-        echo "No relevant ST found, running baseline 2 tests"
-        TESTS="-f search/basicsearch/basic_search.rb -f config/deploy/deploy_and_activate.rb"
-      fi
-      echo "SELECTED_TESTS=$TESTS" >> $GITHUB_ENV
+# .gitlab-ci.yml
+stages:
+  - build
+  - select-tests
+  - system-test
 
-  - name: Run selected system tests
-    run: bin/run-tests-on-swarm.sh $SELECTED_TESTS --consoleoutput
+build-docker:
+  stage: build
+  script:
+    - docker build -t vespa-st:${CI_COMMIT_SHORT_SHA} -f docker/Dockerfile.systemtest .
+  artifacts:
+    paths: [docker-image.tar]
+
+# Stage 1: 分析变更，动态生成测试列表
+select-tests:
+  stage: select-tests
+  script:
+    - |
+      TESTS=$(ruby bin/select-tests.rb \
+        --diff origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME}..HEAD \
+        --top 15 --format json)
+
+      # 如果没选到任何测试，fallback 到 baseline
+      COUNT=$(echo "$TESTS" | ruby -rjson -e 'puts JSON.parse(STDIN.read).size')
+      if [ "$COUNT" -eq "0" ]; then
+        echo "No relevant tests, using baseline"
+        TESTS='[{"file":"search/basicsearch/basic_search.rb"},{"file":"TBD_YOUR_2ND_TEST"}]'
+      fi
+
+      # 生成 child pipeline YAML（每个测试一个并行 job）
+      ruby -rjson -ryaml -e '
+        tests = JSON.parse(ARGV[0])
+        pipeline = tests.each_with_index.map { |t, i|
+          ["st-#{i}", {
+            "stage" => "test",
+            "script" => "bin/run-tests-on-swarm.sh -f #{t["file"]} --consoleoutput --nodelimit 1",
+            "tags" => ["docker", "vespa-st"],
+            "timeout" => "30m",
+            "allow_failure" => t.fetch("score", 100) < 50
+          }]
+        }.to_h
+        pipeline["stages"] = ["test"]
+        File.write("dynamic-st-pipeline.yml", pipeline.to_yaml)
+      ' "$TESTS"
+  artifacts:
+    paths: [dynamic-st-pipeline.yml]
+
+# Stage 2: 并行跑选出的测试
+run-system-tests:
+  stage: system-test
+  trigger:
+    include:
+      - artifact: dynamic-st-pipeline.yml
+        job: select-tests
+    strategy: depend
 ```
+
+**关键优势**：
+
+- **并行**：GitLab child pipeline 的每个 test job 独立并行，总时间 ≈ 最慢的单个 ST（而非串行 N 个）
+- **动态**：每次 MR 根据 diff 自动决定跑哪些，不再硬编码
+- **渐进**：低分测试（score < 50）设为 `allow_failure`，不阻塞 pipeline
+- **Fallback**：没选到相关测试时仍跑 baseline 2 个，保证最低覆盖
+- **可观测**：GitLab UI 上每个 ST 是独立 job，一眼看到哪个挂了
+
+### 与现有 Docker 流程的兼容
+
+你们现在 build docker 就跑 ST，这个不变。变的只是"跑哪些"这个决策从硬编码变成动态的。`run-tests-on-swarm.sh` 的 `-f` 参数已经支持指定单个测试文件，所以不需要改测试执行层。
 
 ### 效果
 
@@ -53,12 +111,13 @@ steps:
 - 改 nearest_neighbor schema → 自动选出 5 个 ANN 测试
 - 改 container 配置 → 自动选出 search_chains 等测试
 - 不相关的变更 → 仍然只跑 2 个 baseline
+- **并行执行**：15 个测试并行跑，总时间可能跟以前串行 2 个差不多
 
-### 你需要补充什么
+### 待确认
 
-1. **确认你们 CI 跑的那 2 个 ST 的具体文件名** — 我把它们设为 fallback baseline
-2. **你们的 CI 环境**：是 GitHub Actions 还是其他？Docker Swarm 在 CI 里怎么启动的？
-3. **可接受的 CI 时长**：目前 2 个 ST 跑多久？能接受到多长？
+1. **你们 CI 跑的那 2 个 ST 的具体文件名** — 设为 fallback baseline
+2. **GitLab Runner 配置**：runner 有 docker executor？能起 Docker Swarm？还是用 k8s executor？
+3. **可接受的 CI 时长**：目前 2 个 ST 跑多久？并行能接受到多少个？
 
 ---
 
@@ -178,14 +237,25 @@ end
 
 **Q: Agent 运行在哪里？**
 
-| 选项 | 优势 | 劣势 | 适合 |
-|------|------|------|------|
-| **Claude Code Web** | 即开即用，已有 | session 时长受限 | Planner, 轻量 Evaluator |
-| **Claude Code CLI + Agent SDK** | 灵活，可编程 | 需要自己编排 | 全部，如果有长运行环境 |
-| **Cursor Cloud Agent** | 长运行，worker 池 | 需要部署 k8s operator | Generator + Evaluator |
-| **混合** | 各取所长 | 复杂度高 | 最终目标 |
+团队主要用 Cursor，所以 **Cursor Cloud Agent (self-hosted)** 是首选执行层：
 
-**建议路径**：先用 Claude Code Web/CLI 验证 Evaluator Agent（里程碑 2 已有工具），再评估是否需要 Cursor Cloud Agent 的长运行能力。
+| 角色 | 运行环境 | 原因 |
+|------|---------|------|
+| **Planner** | Cursor 本地 (Composer) | 交互式对齐需求，团队已熟悉 |
+| **Generator** | Cursor Cloud Worker | Sprint 迭代可能几小时，需要长运行 |
+| **Evaluator** | Cursor Cloud Worker | 跑 ST 慢，独立 worker 不阻塞开发 |
+
+**Cursor Cloud Agent 的关键能力**：
+- Worker 跑在你们 k8s 里，代码和数据不离开内网
+- 每个 session 独占 worker → 可以跑长时间 ST
+- 支持 MCP Server → 直接复用你们的线上 skill（schema/visit/metrics）
+- 支持 Subagent → Evaluator 可以 spawn 多个子 agent 并行跑不同 ST
+- Helm chart 部署 → 和你们现有 k8s 基础设施一致
+
+**渐进路径**：
+1. 先在 Cursor 本地验证 Evaluator prompt（用 Composer 手动跑 select-tests + ST）
+2. 确认有效后，部署 1 个 Cloud Worker 试跑
+3. 扩展到 3-5 worker 池，支持多 Agent 并行
 
 ### Sprint Contract 模板
 
@@ -233,12 +303,11 @@ sprints:
 
 ### 你需要补充什么
 
-8. **Agent 运行环境偏好**：
-   - 你们团队现在用 Claude Code 还是 Cursor？还是都用？
-   - 有没有可以长时间运行 agent 的机器/环境？
-   - 对 Cursor Cloud Agent 的 self-hosted 部署有兴趣吗？需要多大规模？
+8. **Cursor Cloud Agent 部署**：
+   - 你们 k8s 集群有多余资源部署 worker 吗？初始 1-3 个就够
+   - 需要走安全审批流程吗？（worker HTTPS 出站到 Cursor Cloud）
 9. **编排偏好**：
-   - 希望 Agent 全自动（push 触发 → 自动跑完 → 输出 PR review），还是半自动（人在环中确认关键步骤）？
+   - 希望 Agent 全自动（push 触发 → 自动跑完 → 输出 MR review），还是半自动（人在环中确认关键步骤）？
    - 失败后的行为：自动重试修复？还是通知人？
 
 ---
