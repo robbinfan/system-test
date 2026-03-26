@@ -6,13 +6,41 @@
 
 ---
 
-## 第一阶段：精选 System Test 子集 + 本地快速反馈
+## 第一阶段：动态测试筛选 + 本地快速反馈
 
 ### 问题
 
-795 个系统测试全跑不现实（每个测试需部署完整 Vespa 集群），需要建立分层测试策略。
+795 个系统测试全跑不现实（每个测试需部署完整 Vespa 集群），需要智能选择相关测试。
 
 ### 方案
+
+#### 1.0 动态测试筛选（已实现: `bin/select-tests.rb`）
+
+基于代码变更自动选择相关系统测试，无需手动维护测试列表：
+
+```bash
+# 根据 git diff 自动选择测试
+bin/select-tests.rb --diff HEAD~1..HEAD --top 20
+
+# 指定变更文件
+bin/select-tests.rb --files "tests/search/nearest_neighbor/test.sd" --verbose
+
+# 直接输出为 run-tests-on-swarm.sh 参数
+bin/run-tests-on-swarm.sh $(bin/select-tests.rb --diff main..HEAD --top 10 --format runtest)
+```
+
+**筛选策略（6 层打分）：**
+
+| 规则 | 分值 | 说明 |
+|------|------|------|
+| 直接命中 | +100 | 变更文件就是测试文件本身 |
+| 同目录 | +80 | 变更文件和测试在同一 test 目录 |
+| Schema 名匹配 | +60 | 变更的 .sd 文件名出现在测试的 app 中 |
+| 特性重叠 | +0~40 | tensor/hnsw/ranking 等特性指纹匹配 |
+| 框架烟雾测试 | +30 | lib/ 变更时选 basic/smoke 测试 |
+| 分类匹配 | +10 | schema 变更 → search 类测试 |
+
+**特性指纹库**：tensor, hnsw, nearest_neighbor, embedding, bm25, rank_profile, struct_field, document_reference, streaming, searcher, handler, model_evaluation, onnx 等 30+ 特性。
 
 #### 1.1 测试分层
 

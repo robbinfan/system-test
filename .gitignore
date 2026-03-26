@@ -9,3 +9,4 @@ _work/
 *.iml
 target/
 tests/performance/cli_feed_client/data/
+.test-index-cache.json
