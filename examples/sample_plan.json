@@ -1,0 +1,35 @@
+{
+  "summary": "Modified tensor dot product evaluation in searchcore ranking",
+  "changed_components": [
+    {
+      "name": "searchcore/ranking",
+      "change_type": "ranking",
+      "files_changed": [
+        "searchcore/src/vespa/searchcore/proton/matching/match_tools.cpp"
+      ],
+      "description": "Fixed edge case in tensor dot product with sparse tensors"
+    }
+  ],
+  "risk_level": "high",
+  "test_suggestions": [
+    {
+      "category": "search",
+      "area": "ranking",
+      "reason": "Direct ranking changes",
+      "priority": 1
+    },
+    {
+      "category": "search",
+      "area": "tensor_eval",
+      "reason": "Tensor evaluation affected",
+      "priority": 1
+    },
+    {
+      "category": "search",
+      "area": "tensor",
+      "generate_new": true,
+      "generation_hint": "Test tensor dot product with sparse tensors containing zero values"
+    }
+  ],
+  "affected_areas": ["ranking", "tensor", "matching"]
+}

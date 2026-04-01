@@ -1,0 +1,96 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Bash(python -m vespa_evaluator scan *)",
+      "Bash(python -m vespa_evaluator select *)",
+      "Bash(python -m vespa_evaluator stats *)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(git status*)",
+      "Bash(cat test_index.json*)",
+      "Bash(cat /tmp/vespa-eval-*)",
+      "Skill(vespa-eval-gendata)"
+    ],
+    "deny": [
+      "Bash(kubectl * -n default*)",
+      "Bash(kubectl * --all-namespaces*)",
+      "Bash(kubectl delete*)",
+      "Bash(git push * main*)",
+      "Bash(git push * master*)",
+      "Bash(git push --force*)",
+      "Bash(rm -rf *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash(python -m vespa_evaluator evaluate *)",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "即将启动 evaluator 执行测试（可能创建 K8s Pod）。检查参数是否合理，确认继续？"
+          }
+        ]
+      },
+      {
+        "matcher": "Skill(vespa-eval-fix*)",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "vespa-eval-fix 将分析失败并可能修改源代码。确认允许？"
+          }
+        ]
+      },
+      {
+        "matcher": "Skill(cmdb-allocate*)",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "即将通过 CMDB 分配节点资源。请确认分配范围合理。"
+          }
+        ]
+      },
+      {
+        "matcher": "Skill(vespa-visit*)",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "即将 visit 线上 Vespa 数据（只读）。请确认目标 app/schema 正确。"
+          }
+        ]
+      },
+      {
+        "matcher": "Skill(vespa-schema*)",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "即将获取线上 schema 定义（只读）。请确认目标正确。"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash(git push*)",
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "即将 push 代码到远程分支。请确认分支名称正确。"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Skill(vespa-eval-fix*)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '--- eval-fix 执行完毕，请 review 变更: git diff ---'"
+          }
+        ]
+      }
+    ]
+  }
+}
