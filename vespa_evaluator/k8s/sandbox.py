@@ -49,6 +49,9 @@ class SandboxConfig:
     vespa_config_server: str = ""
     # Mount path for system-test repo
     test_repo_pvc: str = "system-test-pvc"
+    # --- Safety guardrails ---
+    max_pods: int = 10            # Hard cap, matches ResourceQuota
+    pod_ttl_seconds: int = 7200   # Force-kill pods older than 2h
     test_repo_mount: str = "/system-test"
 
 
@@ -214,8 +217,18 @@ class SandboxManager:
         Launch a Pod to run a specific test case.
 
         Returns the Pod name for tracking.
+        Raises RuntimeError if max_pods limit would be exceeded.
         """
         await self._ensure_client()
+
+        # --- Safety: enforce pod cap ---
+        await self._reap_expired_pods()
+        if len(self._active_pods) >= self.config.max_pods:
+            raise RuntimeError(
+                f"Pod limit reached ({self.config.max_pods}). "
+                f"Wait for running tests to complete or increase max_pods."
+            )
+
         vespa_hosts = vespa_hosts or []
         pod_name = self._pod_name(test_file, test_method)
         manifest = self._build_pod_manifest(
@@ -325,4 +338,18 @@ class SandboxManager:
     async def cleanup_all(self):
         """Clean up all active Pods."""
         for pod_name in list(self._active_pods):
+            await self.cleanup(pod_name)
+
+    async def _reap_expired_pods(self):
+        """Force-cleanup pods that exceed the TTL. Prevents resource leaks."""
+        now = time.time()
+        expired = [
+            name for name, start in self._active_pods.items()
+            if (now - start) > self.config.pod_ttl_seconds
+        ]
+        for pod_name in expired:
+            logger.warning(
+                f"Pod {pod_name} exceeded TTL ({self.config.pod_ttl_seconds}s), "
+                f"force cleaning up"
+            )
             await self.cleanup(pod_name)

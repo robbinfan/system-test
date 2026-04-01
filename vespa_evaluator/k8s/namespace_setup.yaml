@@ -1,0 +1,134 @@
+# K8s namespace setup for Vespa Evaluator
+# Apply once: kubectl apply -f vespa_evaluator/k8s/namespace_setup.yaml
+#
+# This creates a locked-down namespace with hard resource quotas
+# to prevent runaway pod creation or resource exhaustion.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: vespa-eval
+  labels:
+    app: vespa-evaluator
+    managed-by: vespa-evaluator
+
+---
+# Hard resource quota - cannot be exceeded
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: vespa-eval-quota
+  namespace: vespa-eval
+spec:
+  hard:
+    # Max 10 pods at any time (10 concurrent test cases)
+    pods: "10"
+    # Total CPU across all pods
+    requests.cpu: "20"
+    limits.cpu: "40"
+    # Total memory across all pods
+    requests.memory: "20Gi"
+    limits.memory: "40Gi"
+    # No persistent volume claims by default (tests should be stateless)
+    persistentvolumeclaims: "2"
+
+---
+# Limit ranges - per-pod guardrails
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: vespa-eval-limits
+  namespace: vespa-eval
+spec:
+  limits:
+    - type: Pod
+      max:
+        cpu: "16"
+        memory: "32Gi"
+      min:
+        cpu: "100m"
+        memory: "256Mi"
+    - type: Container
+      default:
+        cpu: "2"
+        memory: "4Gi"
+      defaultRequest:
+        cpu: "500m"
+        memory: "1Gi"
+      max:
+        cpu: "16"
+        memory: "32Gi"
+
+---
+# Network policy - pods can only talk to Vespa services, not the internet
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: vespa-eval-netpol
+  namespace: vespa-eval
+spec:
+  podSelector:
+    matchLabels:
+      app: vespa-evaluator
+  policyTypes:
+    - Egress
+    - Ingress
+  ingress: []  # No inbound traffic
+  egress:
+    # Allow DNS
+    - to: []
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Allow traffic to Vespa config server (19071) and services
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              app: vespa
+      ports:
+        - protocol: TCP
+          port: 19071   # Config server
+        - protocol: TCP
+          port: 8080    # Container/QRS
+        - protocol: TCP
+          port: 19112   # Proton RPC
+
+---
+# Service account with minimal permissions
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vespa-eval-runner
+  namespace: vespa-eval
+
+---
+# Role: can only manage pods in vespa-eval namespace
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: vespa-eval-pod-manager
+  namespace: vespa-eval
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "pods/log", "pods/status"]
+    verbs: ["get", "list", "create", "delete", "watch"]
+  # Cannot exec into pods (no shell access)
+  # Cannot access secrets
+  # Cannot modify the namespace itself
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: vespa-eval-pod-manager-binding
+  namespace: vespa-eval
+subjects:
+  - kind: ServiceAccount
+    name: vespa-eval-runner
+    namespace: vespa-eval
+roleRef:
+  kind: Role
+  name: vespa-eval-pod-manager
+  apiGroup: rbac.authorization.k8s.io
