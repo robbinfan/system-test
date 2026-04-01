@@ -155,3 +155,61 @@ When running outside CI, the evaluator gracefully degrades:
 2. Minimal, targeted changes only
 3. Run the specific failing test to verify before committing
 4. Never disable tests to make CI pass
+
+## Reference: Industry Eval Harness Landscape
+
+Key projects and lessons learned from researching similar systems.
+
+### Closest Architectural Matches
+
+| Project | What it does | What we borrow |
+|---|---|---|
+| **SWE-bench** (Princeton) | LLM fixes real GitHub issues, Docker-per-task isolation | FAIL_TO_PASS + PASS_TO_PASS dual test structure; `pass@k` for flaky tests |
+| **Inspect AI** (UK AISI) | `Dataset→Task→Solver→Scorer` eval framework, K8s sandbox support | Per-sample sandbox isolation; `max_sandboxes` throttle; tool approval system |
+| **Testkube** | K8s-native test orchestration, pod-per-test | `TestWorkflow` CRD pattern; result collection; resource quotas |
+| **Claude Forge** | GAN-style multi-agent code gen (Planner↔Reviewer, Coder↔Reviewer) | **Fix agent must use fresh context** (`context: fork`) to avoid "sympathizing" with generator |
+| **Harbor** | Containerized agent eval with trajectory recording | Agent Trajectory Interchange Format (ATIF); RL/SFT from fix trajectories |
+| **Dapr Agents** (Microsoft) | K8s actor model for AI agents with state persistence | Actor coordination for topology tests (configserver must start before content) |
+
+### Key Design Lessons
+
+1. **Fix agent needs isolated context** (Claude Forge):
+   `vespa-eval-fix` should run with `context: fork` so it evaluates
+   failures honestly, without the generation agent's reasoning context.
+
+2. **`pass@k` for distributed system flakiness** (SWE-bench, Anthropic):
+   Run each test k times (e.g., k=3). Pass rate > threshold = pass.
+   Distributed Vespa tests are inherently nondeterministic.
+
+3. **Warm Pod Pool eliminates cold starts** (K8s Agent Sandbox SIG):
+   Pre-provision a pool of ready-to-go pods with the CI-built image.
+   Critical when images are large (Vespa runner image).
+
+4. **Grade outcomes, not transcripts** (Anthropic CORE-Bench):
+   Don't just parse stdout for "PASS". Check actual cluster state:
+   document count, distribution, ranking scores, config convergence.
+
+5. **Dual test structure** (SWE-bench):
+   After a fix, verify BOTH that the failing test now passes AND
+   that all previously-passing tests still pass (no regressions).
+
+6. **Cache unchanged paths** (Promptfoo):
+   If code changes only touch ranking, don't re-select cases for
+   config tests. Cache selection results keyed by changed components.
+
+7. **Post eval results to PR** (Promptfoo CI/CD pattern):
+   In CI, publish evaluation summary as a PR comment — pass rate,
+   failures, what was tested, what was fixed.
+
+### Further Reading
+
+- SWE-bench: https://github.com/SWE-bench/SWE-bench
+- Inspect AI: https://inspect.aisi.org.uk/
+- Testkube: https://github.com/kubeshop/testkube
+- Harbor: https://github.com/harbor-framework/harbor
+- Claude Forge GAN pattern: https://www.freecodecamp.org/news/how-to-apply-gan-architecture-to-multi-agent-code-generation/
+- Anthropic "Demystifying Evals": https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents
+- Anthropic "Harness Design": https://www.anthropic.com/engineering/harness-design-long-running-apps
+- K8s Agent Sandbox: https://kubernetes.io/blog/2026/03/20/running-agents-on-kubernetes-with-agent-sandbox/
+- METR Task Standard: https://github.com/METR/task-standard
+- Promptfoo: https://github.com/promptfoo/promptfoo
