@@ -9,3 +9,6 @@ _work/
 *.iml
 target/
 tests/performance/cli_feed_client/data/
+__pycache__/
+*.pyc
+test_index.json
