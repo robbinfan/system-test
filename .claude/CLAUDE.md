@@ -30,21 +30,34 @@ python -m vespa_evaluator evaluate --plan examples/sample_plan.json --tests-dir 
 
 ### Skills
 
-- `/vespa-eval-run` — Full pipeline: generate plan from git diff → select cases → execute → auto-fix failures
-- `/vespa-eval-fix` — Analyze test failures, trace to root cause, fix code, re-run
+- `/vespa-eval-run` — Full pipeline: plan → CMDB allocate → select cases → visit live data → execute → auto-fix
+- `/vespa-eval-fix` — Analyze test failures, trace to root cause, fix code, re-run (max 3 iterations)
+- `/vespa-eval-gendata <app> <schema>` — Visit production data, generate realistic test cases
+
+These skills can chain external skills for infrastructure and data access:
+- `cmdb-*` skills — Query CMDB for idle nodes, allocate/release resources
+- `vespa-schema` / `vespa-visit` — Fetch live schemas and documents from production
 
 ### Architecture
 
 ```
-/vespa-eval-run                      /vespa-eval-fix
-┌────────────────────┐              ┌────────────────────┐
-│ 1. Plan (from diff)│              │ 1. Parse failures  │
-│ 2. Select cases    │──failures──→ │ 2. Root cause      │
-│ 3. Execute (K8s)   │              │ 3. Fix code        │
-│ 4. Report          │←──results──  │ 4. Re-evaluate     │
-└────────────────────┘              └────────────────────┘
-         ↑                                    │
-         └──── iterate until pass ────────────┘
+/vespa-eval-run
+┌──────────────────────────────────────────────────────────────┐
+│ 1. Plan (from git diff)                                      │
+│ 2. CMDB → allocate nodes by tier (SMALL/MED/LARGE/XLARGE)   │
+│ 3. Select existing cases from 737+ test index                │
+│ 4. Visit production data → generate realistic cases          │
+│ 5. Execute in K8s Pods (actor-per-case, parallel)            │
+│ 6. Failures? → /vespa-eval-fix (GAN-style loop, max 3x)     │
+│ 7. Release CMDB resources, report                            │
+└──────────────────────────────────────────────────────────────┘
+
+  Generator⇄Evaluator loop (GAN-style):
+  ┌─────────────┐        ┌──────────────┐
+  │ eval-run    │──fail─→│ eval-fix     │
+  │ (Generator) │        │ (Evaluator)  │
+  │ select/gen  │←─fix── │ analyze/fix  │
+  └─────────────┘        └──────────────┘
 ```
 
 ## Test Conventions

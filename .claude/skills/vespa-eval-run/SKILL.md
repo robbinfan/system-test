@@ -1,14 +1,18 @@
 ---
 name: vespa-eval-run
-description: Run the Vespa evaluator pipeline — generate plan from git diff, select test cases, execute in K8s sandboxes, and auto-fix failures. The full Generator⇄Evaluator loop.
-argument-hint: "[git-diff-or-plan-json-path]"
-allowed-tools: Read, Edit, Grep, Glob, Bash(python -m vespa_evaluator *), Bash(git *), Bash(cat *), Skill(vespa-eval-fix)
+description: Run the Vespa evaluator pipeline — generate plan from git diff, select test cases, allocate resources via CMDB, optionally visit production data for realistic tests, execute in K8s sandboxes, and auto-fix failures.
+argument-hint: "[git-diff-or-plan-json-path] [--live-data app/schema] [--cmdb]"
+allowed-tools: Read, Edit, Grep, Glob, Bash(python -m vespa_evaluator *), Bash(git *), Bash(cat *), Skill(vespa-eval-fix), Skill(cmdb-*), Skill(vespa-visit), Skill(vespa-schema)
 ---
 
 # Vespa Eval Run — Full Evaluation Pipeline
 
 You orchestrate the complete **Plan → Select → Execute → Fix** loop for
 Vespa system test evaluation. This is the top-level entry point.
+
+The pipeline can optionally:
+- **Query CMDB** for idle nodes and dynamically allocate resources per test tier
+- **Visit production data** to generate test cases with real data shapes
 
 ## Input
 
@@ -51,6 +55,49 @@ From the diff, produce a plan JSON with:
 - `affected_areas`: Keywords for risk-based expansion search
 
 Save the plan to `/tmp/vespa-eval-plan.json`.
+
+## Step 1.5: Resource Allocation (if --cmdb flag or CMDB skill available)
+
+Query CMDB for available nodes to determine execution capacity:
+
+```
+/cmdb-query --status idle --min-cpu 2 --min-memory 4Gi
+```
+
+Use the response to:
+- Determine `max_concurrency` (how many tests to run in parallel)
+- Classify test tiers: SMALL (config), MEDIUM (search), LARGE (perf), XLARGE (stress)
+- Allocate specific nodes per test based on resource requirements
+
+Tier assignment rules:
+| Test category | num_hosts | Tier | CPU | Memory |
+|---|---|---|---|---|
+| config, smoke | 1 | SMALL | 2 | 4Gi |
+| search, container, docproc | 1 | MEDIUM | 4 | 8Gi |
+| multi-node tests | >1 | LARGE | 8 | 16Gi |
+| performance, stress | any | XLARGE | 16 | 32Gi |
+
+## Step 1.6: Visit Production Data (if --live-data specified)
+
+If `--live-data <app>/<schema>` is provided, fetch real data for test generation:
+
+```
+/vespa-schema --app <app> --schema <schema>
+/vespa-visit --app <app> --schema <schema> --max 50 --selection "<optional-filter>"
+```
+
+This produces:
+- A `.sd` schema file matching production
+- A JSON feed file with sampled (and anonymized) production documents
+- Test cases that exercise real data shapes (tensor dimensions, null patterns, etc.)
+
+Add these generated cases to the selection. They catch edge cases that
+synthetic test data never hits:
+- Tensors with unexpected sparsity
+- Null/missing fields in documents
+- Unicode edge cases in string fields
+- Extreme numeric values
+- WeightedSets with unusual distributions
 
 ## Step 2: Build Test Index (if needed)
 
