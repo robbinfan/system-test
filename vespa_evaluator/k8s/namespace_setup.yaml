@@ -14,6 +14,10 @@ metadata:
 
 ---
 # Hard resource quota - cannot be exceeded
+# Sized for two concurrent modes:
+#   Level 1: up to 10 test runner pods (parallel system tests)
+#   Level 2: 8-11 pods for topology test (3 configserver + 2 QRS + 3-6 content)
+# Total cap = 20 to allow Level 1 + Level 2 overlap during transitions
 apiVersion: v1
 kind: ResourceQuota
 metadata:
@@ -21,16 +25,12 @@ metadata:
   namespace: vespa-eval
 spec:
   hard:
-    # Max 10 pods at any time (10 concurrent test cases)
-    pods: "10"
-    # Total CPU across all pods
-    requests.cpu: "20"
-    limits.cpu: "40"
-    # Total memory across all pods
-    requests.memory: "20Gi"
-    limits.memory: "40Gi"
-    # No persistent volume claims by default (tests should be stateless)
-    persistentvolumeclaims: "2"
+    pods: "20"
+    requests.cpu: "40"
+    limits.cpu: "80"
+    requests.memory: "40Gi"
+    limits.memory: "80Gi"
+    persistentvolumeclaims: "5"
 
 ---
 # Limit ranges - per-pod guardrails
